@@ -1,190 +1,188 @@
-import json
+from collections import defaultdict
 
-from django.conf import settings
-from django.contrib.admin.utils import quote
-from django.contrib.contenttypes.models import ContentType
+from django.apps import apps
 from django.db import models
-from django.urls import NoReverseMatch, reverse
-from django.utils import timezone
-from django.utils.text import get_text_list
-from django.utils.translation import gettext
+from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 
-ADDITION = 1
-CHANGE = 2
-DELETION = 3
 
-ACTION_FLAG_CHOICES = (
-    (ADDITION, _("Addition")),
-    (CHANGE, _("Change")),
-    (DELETION, _("Deletion")),
-)
-
-
-class LogEntryManager(models.Manager):
+class ContentTypeManager(models.Manager):
     use_in_migrations = True
 
-    def log_action(
-        self,
-        user_id,
-        content_type_id,
-        object_id,
-        object_repr,
-        action_flag,
-        change_message="",
-    ):
-        if isinstance(change_message, list):
-            change_message = json.dumps(change_message)
-        return self.model.objects.create(
-            user_id=user_id,
-            content_type_id=content_type_id,
-            object_id=str(object_id),
-            object_repr=object_repr[:200],
-            action_flag=action_flag,
-            change_message=change_message,
-        )
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Cache shared by all the get_for_* methods to speed up
+        # ContentType retrieval.
+        self._cache = {}
+
+    def get_by_natural_key(self, app_label, model):
+        try:
+            ct = self._cache[self.db][(app_label, model)]
+        except KeyError:
+            ct = self.get(app_label=app_label, model=model)
+            self._add_to_cache(self.db, ct)
+        return ct
+
+    def _get_opts(self, model, for_concrete_model):
+        if for_concrete_model:
+            model = model._meta.concrete_model
+        return model._meta
+
+    def _get_from_cache(self, opts):
+        key = (opts.app_label, opts.model_name)
+        return self._cache[self.db][key]
+
+    def get_for_model(self, model, for_concrete_model=True):
+        """
+        Return the ContentType object for a given model, creating the
+        ContentType if necessary. Lookups are cached so that subsequent lookups
+        for the same model don't hit the database.
+        """
+        opts = self._get_opts(model, for_concrete_model)
+        try:
+            return self._get_from_cache(opts)
+        except KeyError:
+            pass
+
+        # The ContentType entry was not found in the cache, therefore we
+        # proceed to load or create it.
+        try:
+            # Start with get() and not get_or_create() in order to use
+            # the db_for_read (see #20401).
+            ct = self.get(app_label=opts.app_label, model=opts.model_name)
+        except self.model.DoesNotExist:
+            # Not found in the database; we proceed to create it. This time
+            # use get_or_create to take care of any race conditions.
+            ct, created = self.get_or_create(
+                app_label=opts.app_label,
+                model=opts.model_name,
+            )
+        self._add_to_cache(self.db, ct)
+        return ct
+
+    def get_for_models(self, *models, for_concrete_models=True):
+        """
+        Given *models, return a dictionary mapping {model: content_type}.
+        """
+        results = {}
+        # Models that aren't already in the cache grouped by app labels.
+        needed_models = defaultdict(set)
+        # Mapping of opts to the list of models requiring it.
+        needed_opts = defaultdict(list)
+        for model in models:
+            opts = self._get_opts(model, for_concrete_models)
+            try:
+                ct = self._get_from_cache(opts)
+            except KeyError:
+                needed_models[opts.app_label].add(opts.model_name)
+                needed_opts[opts].append(model)
+            else:
+                results[model] = ct
+        if needed_opts:
+            # Lookup required content types from the DB.
+            condition = Q(
+                *(
+                    Q(("app_label", app_label), ("model__in", models))
+                    for app_label, models in needed_models.items()
+                ),
+                _connector=Q.OR,
+            )
+            cts = self.filter(condition)
+            for ct in cts:
+                opts_models = needed_opts.pop(ct.model_class()._meta, [])
+                for model in opts_models:
+                    results[model] = ct
+                self._add_to_cache(self.db, ct)
+        # Create content types that weren't in the cache or DB.
+        for opts, opts_models in needed_opts.items():
+            ct = self.create(
+                app_label=opts.app_label,
+                model=opts.model_name,
+            )
+            self._add_to_cache(self.db, ct)
+            for model in opts_models:
+                results[model] = ct
+        return results
+
+    def get_for_id(self, id):
+        """
+        Lookup a ContentType by ID. Use the same shared cache as get_for_model
+        (though ContentTypes are not created on-the-fly by get_by_id).
+        """
+        try:
+            ct = self._cache[self.db][id]
+        except KeyError:
+            # This could raise a DoesNotExist; that's correct behavior and will
+            # make sure that only correct ctypes get stored in the cache dict.
+            ct = self.get(pk=id)
+            self._add_to_cache(self.db, ct)
+        return ct
+
+    def clear_cache(self):
+        """
+        Clear out the content-type cache.
+        """
+        self._cache.clear()
+
+    def _add_to_cache(self, using, ct):
+        """Insert a ContentType into the cache."""
+        # Note it's possible for ContentType objects to be stale; model_class()
+        # will return None. Hence, there is no reliance on
+        # model._meta.app_label here, just using the model fields instead.
+        key = (ct.app_label, ct.model)
+        self._cache.setdefault(using, {})[key] = ct
+        self._cache.setdefault(using, {})[ct.id] = ct
 
 
-class LogEntry(models.Model):
-    action_time = models.DateTimeField(
-        _("action time"),
-        default=timezone.now,
-        editable=False,
-    )
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        models.CASCADE,
-        verbose_name=_("user"),
-    )
-    content_type = models.ForeignKey(
-        ContentType,
-        models.SET_NULL,
-        verbose_name=_("content type"),
-        blank=True,
-        null=True,
-    )
-    object_id = models.TextField(_("object id"), blank=True, null=True)
-    # Translators: 'repr' means representation
-    # (https://docs.python.org/library/functions.html#repr)
-    object_repr = models.CharField(_("object repr"), max_length=200)
-    action_flag = models.PositiveSmallIntegerField(
-        _("action flag"), choices=ACTION_FLAG_CHOICES
-    )
-    # change_message is either a string or a JSON structure
-    change_message = models.TextField(_("change message"), blank=True)
-
-    objects = LogEntryManager()
+class ContentType(models.Model):
+    app_label = models.CharField(max_length=100)
+    model = models.CharField(_("python model class name"), max_length=100)
+    objects = ContentTypeManager()
 
     class Meta:
-        verbose_name = _("log entry")
-        verbose_name_plural = _("log entries")
-        db_table = "django_admin_log"
-        ordering = ["-action_time"]
-
-    def __repr__(self):
-        return str(self.action_time)
+        verbose_name = _("content type")
+        verbose_name_plural = _("content types")
+        db_table = "django_content_type"
+        unique_together = [["app_label", "model"]]
 
     def __str__(self):
-        if self.is_addition():
-            return gettext("Added “%(object)s”.") % {"object": self.object_repr}
-        elif self.is_change():
-            return gettext("Changed “%(object)s” — %(changes)s") % {
-                "object": self.object_repr,
-                "changes": self.get_change_message(),
-            }
-        elif self.is_deletion():
-            return gettext("Deleted “%(object)s.”") % {"object": self.object_repr}
+        return self.app_labeled_name
 
-        return gettext("LogEntry Object")
+    @property
+    def name(self):
+        model = self.model_class()
+        if not model:
+            return self.model
+        return str(model._meta.verbose_name)
 
-    def is_addition(self):
-        return self.action_flag == ADDITION
+    @property
+    def app_labeled_name(self):
+        model = self.model_class()
+        if not model:
+            return self.model
+        return "%s | %s" % (model._meta.app_label, model._meta.verbose_name)
 
-    def is_change(self):
-        return self.action_flag == CHANGE
+    def model_class(self):
+        """Return the model class for this type of content."""
+        try:
+            return apps.get_model(self.app_label, self.model)
+        except LookupError:
+            return None
 
-    def is_deletion(self):
-        return self.action_flag == DELETION
-
-    def get_change_message(self):
+    def get_object_for_this_type(self, **kwargs):
         """
-        If self.change_message is a JSON structure, interpret it as a change
-        string, properly translated.
+        Return an object of this type for the keyword arguments given.
+        Basically, this is a proxy around this object_type's get_object() model
+        method. The ObjectNotExist exception, if thrown, will not be caught,
+        so code that calls this method should catch it.
         """
-        if self.change_message and self.change_message[0] == "[":
-            try:
-                change_message = json.loads(self.change_message)
-            except json.JSONDecodeError:
-                return self.change_message
-            messages = []
-            for sub_message in change_message:
-                if "added" in sub_message:
-                    if sub_message["added"]:
-                        sub_message["added"]["name"] = gettext(
-                            sub_message["added"]["name"]
-                        )
-                        messages.append(
-                            gettext("Added {name} “{object}”.").format(
-                                **sub_message["added"]
-                            )
-                        )
-                    else:
-                        messages.append(gettext("Added."))
+        return self.model_class()._base_manager.using(self._state.db).get(**kwargs)
 
-                elif "changed" in sub_message:
-                    sub_message["changed"]["fields"] = get_text_list(
-                        [
-                            gettext(field_name)
-                            for field_name in sub_message["changed"]["fields"]
-                        ],
-                        gettext("and"),
-                    )
-                    if "name" in sub_message["changed"]:
-                        sub_message["changed"]["name"] = gettext(
-                            sub_message["changed"]["name"]
-                        )
-                        messages.append(
-                            gettext("Changed {fields} for {name} “{object}”.").format(
-                                **sub_message["changed"]
-                            )
-                        )
-                    else:
-                        messages.append(
-                            gettext("Changed {fields}.").format(
-                                **sub_message["changed"]
-                            )
-                        )
-
-                elif "deleted" in sub_message:
-                    sub_message["deleted"]["name"] = gettext(
-                        sub_message["deleted"]["name"]
-                    )
-                    messages.append(
-                        gettext("Deleted {name} “{object}”.").format(
-                            **sub_message["deleted"]
-                        )
-                    )
-
-            change_message = " ".join(msg[0].upper() + msg[1:] for msg in messages)
-            return change_message or gettext("No fields changed.")
-        else:
-            return self.change_message
-
-    def get_edited_object(self):
-        """Return the edited object represented by this log entry."""
-        return self.content_type.get_object_for_this_type(pk=self.object_id)
-
-    def get_admin_url(self):
+    def get_all_objects_for_this_type(self, **kwargs):
         """
-        Return the admin URL to edit the object represented by this log entry.
+        Return all objects of this type for the keyword arguments given.
         """
-        if self.content_type and self.object_id:
-            url_name = "admin:%s_%s_change" % (
-                self.content_type.app_label,
-                self.content_type.model,
-            )
-            try:
-                return reverse(url_name, args=(quote(self.object_id),))
-            except NoReverseMatch:
-                pass
-        return None
+        return self.model_class()._base_manager.using(self._state.db).filter(**kwargs)
+
+    def natural_key(self):
+        return (self.app_label, self.model)
