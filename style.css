@@ -1,0 +1,55 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background-color: #f0f0f0;
+}
+
+main {
+  width: 70%;
+  margin: auto;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  flex-direction: row;
+}
+
+.sedans{
+    background-color: rgba(238, 155, 0, 0.877);
+    padding: 2em;
+}
+
+h3{
+    color: white;
+    font: bold;
+    padding-bottom: 30px;
+    padding-top: 20px;
+}
+p{
+    color: white;
+    padding-bottom: 50px;
+}
+
+button{
+    padding: 10px;
+    border-radius: 20px;
+    border-color: white;
+    color: white;
+    border: 1px solid;
+    cursor: pointer;
+    
+    background-color: transparent;
+}
+.suvs{
+    background-color: rgb(21, 100, 21);
+    padding: 2em;
+}
+
+.luxury{
+    background-color: rgb(5, 65, 5);
+    padding: 2em;
+}
